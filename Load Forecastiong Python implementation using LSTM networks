@@ -1,0 +1,435 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import timeit
+from sklearn.preprocessing import MinMaxScaler ,MinMaxScaler , StandardScaler
+from keras.layers.recurrent import LSTM
+from keras.layers.core import Activation, Dense, Dropout
+from keras.models import Sequential
+from keras.callbacks import ModelCheckpoint
+from keras import optimizers
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+import matplotlib as mpl
+import warnings
+warnings.filterwarnings('ignore')
+import os
+import tensorflow as tf
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+# Συνάρτηση για διάβασμα των δεδομένων ενέργειας
+def readdata(delimiter,filename):
+    plt.close('all')
+    dataframe = pd.read_csv(filename,sep = delimiter)
+    dataframe = dataframe.loc[:, ~dataframe.columns.str.contains('^Unnamed')]
+    return dataframe
+
+# Συνάρτηση για επεξεργασία των δεδομένων
+def process_data(data):
+    list1=[]
+    list2=[]
+    for i in range(1,len(data)-15,15):
+        list1.append(data["totalnrg"][i:i+15].sum())
+        list2.append(data["Timestamp"][i+14])
+    dataw=pd.DataFrame(list1,columns =['Total'])
+    dataw["datetime"]=list2
+    return dataw
+
+# Συνάρτηση για επεεξεργασία των καιρικών δεδομένων
+def process_weather_data(dataweather):
+    listtemp=[]
+    listtime=[]
+    listhumidity=[]
+    listwspreed=[]
+    listpre=[]
+    listwdirection=[]
+    listrainfall=[]
+    listsfall=[]
+    listsd=[]
+    listswi=[]
+    for i in range(0,len(dataweather),1):
+        listtime.append((dataweather["UT time"][i]))
+        listtemp.append(dataweather["Temperature"][i])
+        listhumidity.append(dataweather["Relative Humidity"][i])
+        listwspreed.append(dataweather["Wind speed"][i])
+        listpre.append(dataweather["Pressure"][i])
+        listwdirection.append(dataweather["Wind direction"][i])
+        listrainfall.append(dataweather["Rainfall"][i])
+        listsfall.append(dataweather["Snowfall"][i])
+        listsd.append(dataweather["Snow depth"][i])
+        listswi.append(dataweather["Short-wave irradiation"][i])
+    
+    dataw=pd.DataFrame(listtemp,columns =['Temperature'])
+    dataw["Relative Humidity"]=listhumidity
+    dataw["Wind speed"]=listwspreed
+    dataw["UT time"]=listtime
+    dataw["Pressure"]=listpre
+    dataw["Wind direction"]=listwdirection
+    dataw["Rainfall"]=listrainfall
+    dataw["Snowfall"]=listsfall
+    dataw["Snow depth"]=listsd
+    dataw["Short-wave irradiation"]=listswi
+
+    return dataw
+
+# Function to canculate absolute percentage error ( MAPE ) 
+def mean_absolute_percentage_error(y_true, y_pred):
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+
+# Create the final dataframe/ Τελική δομή δεδομένων 
+def create_final_dataframe(pdata, wdata):
+    databfinal=pd.DataFrame()
+    pdata["Totpower"]=pdata["Total"].shift(-1)
+
+    k=min(len(pdata)-1,len(wdata)-2)+1
+    # ισως πρέπει να πάει k+1 
+    databfinal["Total"]=pdata["Total"][:k]
+    databfinal["datetime"]=pdata["datetime"][0:k]
+    databfinal["Totpower"]=pdata["Totpower"][0:k]
+    databfinal["Relative Humidity"]=wdata["Relative Humidity"][0:k]
+    databfinal["Wind speed"]=wdata["Wind speed"][0:k]
+    databfinal["Temperature"]=wdata["Temperature"][0:k]
+    databfinal["Pressure"]=wdata["Pressure"][0:k]
+    databfinal["Wind direction"]=wdata["Wind direction"][0:k]
+    databfinal["Rainfall"]=wdata["Rainfall"][0:k]
+    databfinal["Snowfall"]=wdata["Snowfall"][0:k]
+    databfinal["Snow depth"]=wdata["Snow depth"][0:k]
+    databfinal["Short-wave irradiation"]=wdata["Short-wave irradiation"][0:k]
+    
+    #------ Convert the Fer to Celsius ----------
+    celsius = (databfinal['Temperature'])-273.15
+    databfinal['celsius']=celsius
+
+    return databfinal    
+
+#  Επεξεργασία δεδομένων 
+def datetime_extract(databfinal):
+    databfinal.datetime = pd.to_datetime(databfinal.datetime)
+    databfinal["Hour"]=databfinal["datetime"].dt.hour
+    databfinal["time_of_day"]=databfinal["Hour"]
+    databfinal["weekday"]=databfinal["datetime"].dt.dayofweek
+    databfinal["day_of_year"]=databfinal["datetime"].dt.dayofyear
+    databfinal["day"]=databfinal["datetime"].dt.day
+    databfinal["month"]=databfinal["datetime"].dt.month
+    databfinal["day_of_year"]=databfinal["day_of_year"]/365
+    databfinal["time_of_day"]=databfinal["Hour"]/24
+
+    return databfinal
+
+# Συνάρτηση για εξαγωγή στατιστικών για ενέργεια 
+def statistics_data(databfinal):
+    mean_total_power=databfinal["Totpower"].mean()
+    std_total_power=databfinal["Totpower"].std()
+    max_total_power=databfinal["Totpower"].max()
+    min_total_power=databfinal["Totpower"].min()
+    print("Mean total power : ",(mean_total_power))
+    print("Std  total power : ",(std_total_power))
+    print("Max  total power : ", (max_total_power))
+    print("Min  total power : ",(min_total_power ))
+
+    return min_total_power, max_total_power,mean_total_power, std_total_power 
+
+# Anomaly detection Function  .Χρήση της γκαουσιανής συνάρτησης
+def anomalydetection(dataframe):
+    v=dataframe.copy()
+    array1=np.asarray(v["Totpower"][:])
+    mean1=array1.mean()
+    std1=array1.std()
+    cutoff1=mean1+3*std1
+    cutoff2=mean1-3*std1
+    v["Totpower"] = np.where(v["Totpower"]>cutoff1, float("NaN"),v['Totpower'])
+    v["Totpower"] = np.where(v["Totpower"]<cutoff2, float("NaN"),v['Totpower'])
+    dataframe["Totpower"][:]=v["Totpower"][:]
+    return dataframe
+
+# Επεξεργασία δεδομένων datafrane
+def process_dataframe_data(datawo1,step1,numk):
+    
+    # previous 15 minutes dataframe column
+    dk=datawo1['Totpower'].shift(1)
+    datawo1['previous 15 minutes']=dk
+    datawo1['previous 15 minutes'][0]=0
+    
+    #previous  30 minutes dataframe column
+    dk=datawo1['Totpower'].shift(2)
+    datawo1['previous 30 minutes']=dk
+    datawo1['previous 30 minutes'][0]=0
+    datawo1['previous 30 minutes'][1]=0
+
+    #previous 45 minutes dataframe column
+    dk=datawo1['Totpower'].shift(3)
+    datawo1['previous 45 minutes']=dk
+    datawo1['previous 45 minutes'][0]=0
+    datawo1['previous 45 minutes'][1]=0
+    datawo1['previous 45 minutes'][2]=0
+
+    #previous 1 hour 
+    dk=datawo1['Totpower'].shift(4)
+    datawo1['previous 1 hour']=dk
+    datawo1['previous 1 hour'][0:4]=0
+
+    dk1=datawo1['Totpower'].shift(step1)
+    datawo1['previous 1 week']=dk1
+    datawo1['previous 1 week'][0:step1]=0
+    dkp=datawo1['Totpower'].shift(numk)
+    datawo1['previous 1 day']=dkp
+    datawo1['previous 1 day'][0:numk]=0
+
+    return datawo1
+
+# Degree days : Label 1 οταν η θερμοκρασία έιναι σε κάποιο όριο
+def degree_days_value(datawo1,base_temp1,base_temp2):
+    datawo1["degree days"]=0
+    datawo1["degree days"] = np.where((datawo1["celsius"]>base_temp1),abs(datawo1["celsius"]-base_temp1),datawo1["degree days"])
+    datawo1["degree days"] = np.where((datawo1["celsius"]<base_temp2),abs(datawo1["celsius"]-base_temp2),datawo1["degree days"])
+
+    return datawo1
+
+# Test function  Return pred and time_dif
+# 4 months prediction
+def test_function(test_X,predicted):
+    startest = timeit.default_timer()
+    for numb in range(step):
+        x4=np.reshape(test_X[numb], (test_X[numb].shape[1], test_X[numb].shape[0], 1))
+        x5=model.predict(x4)
+        x6=x5.tolist()
+        predicted[numb]=x6
+    stoptest = timeit.default_timer()
+    time_dif=stoptest-startest
+    predicted1=np.asarray(predicted)
+    pred=np.reshape(predicted1,(predicted1.shape[0],predicted1.shape[1]))
+
+    return pred , time_dif
+
+#  LSTM  αποτελέσματα
+def LSTM_accurancy_info(array1,dfdata,step1,step,time_dif,M,startrain,stoptrain):
+
+    #------  Initial day - End day and Accurancy 
+    print(" Intial test date ")
+    print(array1[int(len(dfdata)-step)+step1])
+    print("End test date")
+    print(array1[-1])
+    date=str(array1[int(len(dfdata)-step)+step1]) + " " +" -"+ " " +str(array1[-1])
+    print( "Accurancy")
+    print(100-M , "%")
+    list1.append(100-M)
+    print (" Time details :")
+    xronos.append(stoptrain-startrain)
+    print('Time Train: ', stoptrain - startrain)
+    xronos.append(time_dif)
+    print('Time Test: ', time_dif)
+    print("---- Ξεκίνημα νέας περιόδου--------")
+    return list1, xronos ,date
+
+# Plot the graph της προβλεπόμενης και της πραγματικής τιμής
+def plot_graph(realvalue,predictedvalue,dateall):
+    realvalue1 =[ float(i) for i in realvalue]
+    predictedvalue1=[float(i) for i in predictedvalue]
+    dateall2=[str(i) for i in dateall]
+    mpl.rcParams.update(mpl.rcParamsDefault)
+    plt.rcParams["font.weight"] = "bold"
+    plt.rcParams["axes.labelweight"] = "bold"
+    plt.rcParams["figure.figsize"] = (60,20)
+    plt.rcParams.update({'font.size':30})
+    p1=plt.plot(dateall,realvalue1,label='Πραγματική τιμή της κατανάλωσης')
+    p2=plt.plot(dateall,predictedvalue1,label='Προβλεπόμενη τιμή της κατανάλωσης')
+    plt.title(" Πραγματική τιμή vs Προβλεπόμενη τιμή  Πρόβλεψη 15 λεπτών {} Περίοδο πρόβλεψης : 4 εβδομάδες  ".format(nameofpic),fontweight='bold',fontsize=40)
+    plt.legend((p1[0], p2[0]), ('Πραγματική τιμή ', 'Προβλεπόμενη τιμή '))
+    plt.xlabel("Χρόνος",fontweight='bold',fontsize=40)
+    plt.ylabel(" Τιμή Κατανάλωσης σε Kwh",fontweight='bold',fontsize=40)
+
+    plt.plot()
+    # SAVE THE PLOT 
+    plt.savefig(" {}.jpg".format(nameofpic))
+
+    plt.show()
+# Plot the statuc data
+def min_max_graoh(dates,mean_power,max_power,min_power):  
+  mpl.rcParams.update(mpl.rcParamsDefault)
+  plt.rcParams["font.weight"] = "bold"
+  plt.rcParams["axes.labelweight"] = "bold"
+  plt.rcParams["figure.figsize"] = (20,10)
+  plt.rcParams.update({'font.size':17})
+  x1=[str(i+1)+ " "+ " Περίοδος πρόβλεψης " for i in range(len(dates))]
+  plt.scatter(x1,mean_power,label='Mean values',color='b',linewidths=5)
+  plt.scatter(x1,max_power,label="Max values",color='g',linewidths=5)
+  plt.scatter(x1,min_power,label="Min values",color='r',linewidths=5)
+  plt.title(" Στατιστικές παράμετροι ανά περίοδο πρόβλεψης για το {}".format(nameofpic))
+  plt.legend(['Mean Values', 'Max values','Min values'],prop={'size': 13})
+  plt.xlabel("Περίοδοι πρόβλεψης")
+  plt.ylabel(" Τιμή Κατανάλωσης σε Kwh")
+
+  for y1 in [mean_power,max_power,min_power]:
+    for x,y in zip(x1,y1):
+        label = "{:.2f}".format(y) +" " + "Kwh"
+        plt.annotate(label,(x,y), textcoords="offset points", xytext=(0,10),ha='center',fontsize=15) 
+  
+  plt.savefig(" {}".format(nameofpic)+" Mean MAx VALUE.jpg")
+  plt.show()
+
+# Δημιουργία Box Plot
+def box_plot_creation(testdt):
+  mpl.rcParams.update(mpl.rcParamsDefault)
+  plt.rcParams["font.weight"] = "bold"
+  plt.rcParams["axes.labelweight"] = "bold"
+  plt.rcParams["figure.figsize"] = (30,10)
+  plt.rcParams.update({'font.size':20})
+  data=[(np.array(testdt[i])) for i in range(len(testdt))]
+  xxx=data
+  xxx[0].shape
+  xx=[]
+  for i in range(len(xxx)):
+    xx.append(xxx[i].reshape(len(xxx[i]),))
+
+  #xx=[xxx[0].reshape(len(xxx[0]),)  ,xxx[1].reshape(len(xxx[0]),)  ,xxx[2].reshape(len(xxx[2]),)  , xxx[3].reshape(len(xxx[0]),)  ]
+  plt.boxplot(xx)
+  plt.title(" Στατιστική ανάλυση των προβλέψεων φορτίου για το {} με την χρήση Box plots ".format(nameofpic))
+  plt.xlabel("Περίοδοι πρόβλεψης")
+  plt.ylabel("Τιμή Κατανάλωσης σε Kwh")
+  plt.savefig(" {}".format(nameofpic)+" BOX PLOT.jpg")
+
+  plt.show()
+
+
+# Main program
+nameofpic=input("Give a name for the saved picutre")
+x1file=input("Weather  file")
+x2file=input("Data  file")
+x3=input("Destination of h model")
+dataweather=readdata(";",x1file)
+data=readdata(';',x2file)
+pdata=process_data(data)
+wdata=process_weather_data(dataweather)
+databfinal=create_final_dataframe(pdata, wdata)
+databfinal=datetime_extract(databfinal)
+daysperweek=7
+hoursperday=96
+numberofpredictions=9
+#steo1= 7*96 sum of 15 λεπτών σε μια εβδομάδα
+step1=daysperweek*hoursperday
+# $*7 μέρες =  περίοδο πρόβλεψης
+step=4*step1
+endpoint= len(databfinal)-numberofpredictions*step1
+startpoint=0
+kv=0
+numtrain=5*step
+daysofselect=numberofpredictions*step1
+# Θερμοκρασίες βάσης για degree days
+base_temp1=16
+base_temp2=21
+datawo=databfinal.copy()
+# Create list to canculate the following parameters
+list1=[]
+xronos=[]
+predictedvalue=[]
+realvalue=[]
+dateall=[]
+dates=[]
+testdt=[]
+# Στοιχεία για στατιστικά στοιχεία 
+mean_power=[]
+min_power=[]
+max_power=[]
+std_power=[]
+for c in range(startpoint,endpoint+1,step):
+    predicted = [ 0 for nub in range (step)]
+    startrain = timeit.default_timer()
+    startday=int(c-kv*step)
+    datawo1=datawo[startday:c+daysofselect]
+    # Variable to take after first interation 2 months as training set
+    kv=1
+    array1=np.asarray((datawo1["datetime"]))
+    datawo2=datawo1[:len(datawo1)-step]
+    datawo2=anomalydetection(datawo2)
+    datawo2['Totpower']=datawo2['Totpower'].interpolate(method='cubic')
+    datawo1[:len(datawo1)-step]=datawo2.copy()
+    datawo1=process_dataframe_data(datawo1,step1,hoursperday)
+    datawo1=degree_days_value(datawo1,base_temp1,base_temp2)
+
+    #  Isolate the data
+    dfinal=datawo1[step1:] 
+    df = dfinal[['Totpower','previous 15 minutes','previous 30 minutes', 'previous 45 minutes','previous 1 hour','previous 1 week','previous 1 day','celsius','degree days','Relative Humidity','Wind direction',"time_of_day",'weekday','day_of_year','Rainfall']]
+
+    # Scalling 
+    scaler = MinMaxScaler(feature_range=(-1, 1))
+    df['Relative Humidity']=scaler.fit_transform(df[['Relative Humidity']])
+    df['celsius']=scaler.fit_transform(df[['celsius']])
+    df['Wind direction']=scaler.fit_transform(df[['Wind direction']])
+    df['Rainfall']=scaler.fit_transform(df[['Rainfall']])
+
+    # Scale2: Features between  0 ,1
+    scaler1=MinMaxScaler(feature_range=(0,1))
+    df["weekday"]=scaler1.fit_transform(df[["weekday"]])
+    df["degree days"]=scaler1.fit_transform(df[["degree days"]])
+
+    dfdata=df.copy()
+    dftrain=dfdata[ :int(len(dfdata)-step)]
+    x_train ,y_train= dftrain.drop('Totpower' ,axis=1), dftrain.Totpower
+    train_X = np.reshape(x_train.values, (x_train.shape[0], x_train.shape[1],1))
+    # Test set :4 weeks
+    dftest=dfdata[int(len(dfdata)-step):]
+    x_test,y_test=dftest.drop('Totpower', axis=1) , dftest.Totpower
+    test_X = np.reshape(x_test.values, (x_test.shape[0], x_test.shape[1], 1))
+
+    # LSTM  model
+    model=Sequential()
+    model.add(LSTM(150,return_sequences=True, input_shape=(train_X.shape[1],1),activation='relu'))
+    model.add(Dropout(0.1))
+    model.add(LSTM(150,return_sequences=True, activation='relu'))
+    model.add(Dropout(0.1))
+    model.add(LSTM(150, activation='relu'))
+    model.add(Dropout(0.1))
+    model.add(Dense(1))
+    model.compile(optimizer="adam",loss="mean_absolute_percentage_error")
+    # ModelCheckpoint :save the best
+    chackpath=x3 +"/model.{epoch:02d}-{val_loss:.2f}.h5"
+    checkpoint = ModelCheckpoint(chackpath,monitor='val_loss', verbose=1, save_best_only=True, mode='min')
+    callbacks_list = [checkpoint]
+    model.fit(train_X, y_train, batch_size=128,epochs=200,callbacks=callbacks_list, validation_split=0.1, verbose=0,use_multiprocessing=True)
+
+    stoptrain=timeit.default_timer()
+    # Part of prediction
+    pred , time_dif=test_function(test_X,predicted)
+    # Test data
+    testdata=dfinal["Totpower"][int(len(dfdata)-step):].values
+    testfinal=testdata.reshape(len(testdata),1)
+    # Canculate mean_absolute_percentage error
+    M=mean_absolute_percentage_error(testfinal,pred)
+    list1 , xronos,date =LSTM_accurancy_info(array1,dfdata,step1,step,time_dif,M,startrain,stoptrain)
+    # Create predicted and test arrays 
+    for b in pred:
+        predictedvalue.append(b)
+    for x in testfinal:
+        realvalue.append(x)
+    datefinal=array1[int(len(dfdata)-step)+step1:]
+    for t in datefinal:
+        dateall.append(t)
+    testdt.append(testfinal)
+    dates.append(date)
+    # update the parameters of Totpower
+    datawo["Totpower"][startday:c+daysofselect]=datawo1["Totpower"][:]
+    min1, max1,mean1,std1=statistics_data(dftest)
+    min_power.append(min1)
+    max_power.append(max1) 
+    mean_power.append(mean1)
+    std_power.append(std1)
+
+print( " Accurancy ")
+print(list1)
+print ( "Time details Overall")
+print(xronos)
+list2=np.asarray(list1)
+list3=list2.mean()
+print("Mean percentage ")
+print(list3)
+plot_graph(realvalue,predictedvalue,dateall)
+min_max_graoh(dates,mean_power,max_power,min_power)
+box_plot_creation(testdt)
+xronostrain=[xronos[y] for y in range(0,len(xronos),2)]
+xronostest=[xronos[y] for y in range(1,len(xronos),2)]
+wp=pd.DataFrame(xronostrain ,columns=['Train time'])
+wp['test time']=xronostest
+wp["Accurancy"]=list1
+wp['Mean accurancy']=list3
+wp.to_csv("Info of {}".format(nameofpic))
